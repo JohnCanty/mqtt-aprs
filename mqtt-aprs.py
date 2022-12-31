@@ -319,12 +319,12 @@ def callback(packet):
 def publish_aprstomqtt(inssid, inname, invalue):
     topic_path = MQTT_TOPIC + "/" + inssid + "/" + inname
     logging.debug("Publishing topic: %s with value %s" % (topic_path, invalue))
-    mqttc.publish(topic_path, unicode(invalue).encode('utf-8').strip())
+    mqttc.publish(topic_path, str(invalue).encode('utf-8').strip())
 
 def publish_aprstomqtt_nossid(invalue):
     topic_path = MQTT_TOPIC
     logging.debug("Publishing topic: %s with value %s" % (topic_path, invalue))
-    mqttc.publish(topic_path, unicode(invalue).encode('utf-8').strip())
+    mqttc.publish(topic_path, str(invalue).encode('utf-8').strip())
 
 
 def get_distance(inlat, inlon):
