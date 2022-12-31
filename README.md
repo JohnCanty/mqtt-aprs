@@ -3,6 +3,10 @@ Connects to the specified APRS-IS server, and posts the APRS output to MQTT.  Ca
 
 This script uses the aprslib, https://github.com/rossengeorgiev/aprs-python, to do the heavy APRS lifting.
 
+This is a fork from https://github.com/eloebl/mqtt-aprs
+
+Making some updates to run on Bullseye
+
 INSTALL
 =================
 ```
