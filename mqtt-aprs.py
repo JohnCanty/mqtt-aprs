@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: iso-8859-1 -*-
 
 __author__ = "Mike Loebl"
@@ -17,7 +17,7 @@ import sys
 import binascii
 
 import paho.mqtt.client as paho
-import ConfigParser
+import configparser
 
 import setproctitle
 
@@ -26,7 +26,7 @@ import aprslib
 from datetime import datetime, timedelta
 
 # Read the config file
-config = ConfigParser.RawConfigParser()
+config = configparser.RawConfigParser()
 # TODO: Fix path: 
 config.read("/etc/mqtt-aprs/mqtt-aprs.cfg")
 
@@ -293,7 +293,7 @@ def callback(packet):
 
         altitude = aprspacket.get('altitude', None)
         if altitude:
-            if METRICUNITS is "0":
+            if METRICUNITS == "0":
                 altitude = altitude / 0.3048
             logging.debug("altitude: %s", round(altitude, 0))
             publish_aprstomqtt(ssid, "altitude",round(altitude, 0))
@@ -347,7 +347,7 @@ def get_distance(inlat, inlon):
 
         distance = R  * c
 
-        if METRICUNITS is "0":
+        if METRICUNITS == "0":
             distance = distance * 0.621371
                 
         return round(distance, 2)
