@@ -16,6 +16,7 @@ sudo pip install setuptools
 sudo pip install setproctitle
 sudo pip install paho-mqtt
 sudo pip install aprslib
+sudo pip install configparser
 
 mkdir /etc/mqtt-aprs/
 git clone git://github.com/mloebl/mqtt-aprs.git /usr/local/mqtt-aprs/
