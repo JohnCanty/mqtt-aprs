@@ -18,8 +18,9 @@ sudo pip install paho-mqtt
 sudo pip install aprslib
 sudo pip install configparser
 
-mkdir /etc/mqtt-aprs/
-git clone git://github.com/JohnCanty/mqtt-aprs.git /usr/local/mqtt-aprs/
+sudo mkdir /etc/mqtt-aprs/
+sudo mkdir 
+sudo git clone git://github.com/JohnCanty/mqtt-aprs.git /usr/local/mqtt-aprs/
 
 If write permissions or cloning seem to not work:
 cd ~
@@ -28,18 +29,20 @@ cd mqtt-aprs
 git clone git://github.com/JohnCanty/mqtt-aprs.git
 cp * /etc/mqtt-aprs/
 
-cp /usr/local/mqtt-aprs/mqtt-aprs.cfg.example /etc/mqtt-aprs/mqtt-aprs.cfg
+sudo cp /usr/local/mqtt-aprs/mqtt-aprs.cfg.example /etc/mqtt-aprs/mqtt-aprs.cfg
+Modify this with your information. Add your callsign, your password, and any other filters you are looking to apply.
 
-
-cp /usr/local/mqtt-aprs/mqtt-aprs.default /etc/default/mqtt-aprs
+sudo cp /usr/local/mqtt-aprs/mqtt-aprs.default /etc/default/mqtt-aprs
+sudo cp /usr/local/mqtt-aprs/mqtt-aprs.service /lib/systemd/system/
 ```
-Edit /etc/default/mqtt-aprs and /etc/mqtt-aprs/mqtt-aprs.cfg to suit.
+Load the Systemd service file:
+`sudo systemctl daemon-reload`
 
-Set executable on the service:
-`sudo chmod a+x /etc/init.d/mqtt-aprs`
+Enable the service:
+`sudo systemctl enable mqtt-aprs`
 
 Start the service:
-`/etc/init.d/mqtt-aprs start`
+`sudo systemctl start mqtt-aprs`
 
 APRS is a registered trademark Bob Bruninga, WB4APR
 
