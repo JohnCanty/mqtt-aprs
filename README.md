@@ -19,10 +19,18 @@ sudo pip install aprslib
 sudo pip install configparser
 
 mkdir /etc/mqtt-aprs/
-git clone git://github.com/mloebl/mqtt-aprs.git /usr/local/mqtt-aprs/
+git clone git://github.com/JohnCanty/mqtt-aprs.git /usr/local/mqtt-aprs/
+
+If write permissions or cloning seem to not work:
+cd ~
+mkdir mqtt-aprs
+cd mqtt-aprs
+git clone git://github.com/JohnCanty/mqtt-aprs.git
+cp * /etc/mqtt-aprs/
+
 cp /usr/local/mqtt-aprs/mqtt-aprs.cfg.example /etc/mqtt-aprs/mqtt-aprs.cfg
-cp /usr/local/mqtt-aprs/mqtt-aprs.init /etc/init.d/mqtt-aprs
-update-rc.d mqtt-aprs defaults
+
+
 cp /usr/local/mqtt-aprs/mqtt-aprs.default /etc/default/mqtt-aprs
 ```
 Edit /etc/default/mqtt-aprs and /etc/mqtt-aprs/mqtt-aprs.cfg to suit.
