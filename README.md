@@ -10,39 +10,74 @@ Making some updates to run on Bullseye
 INSTALL
 =================
 ```
-sudo apt-get install git python-pip
+Install Puthon and dependencies:
 
-sudo pip install setuptools
-sudo pip install setproctitle
-sudo pip install paho-mqtt
-sudo pip install aprslib
-sudo pip install configparser
+apt update
+apt install -y git python3 python3-venv python3-pip ca-certificates nano
 
-sudo mkdir /etc/mqtt-aprs/
-sudo mkdir 
-sudo git clone git://github.com/JohnCanty/mqtt-aprs.git /usr/local/mqtt-aprs/
 
-If write permissions or cloning seem to not work:
-cd ~
-mkdir mqtt-aprs
-cd mqtt-aprs
-git clone git://github.com/JohnCanty/mqtt-aprs.git
-cp * /etc/mqtt-aprs/
+Create the User:
+- If logged in as root, you may have to use the full path here
 
-sudo cp /usr/local/mqtt-aprs/mqtt-aprs.cfg.example /etc/mqtt-aprs/mqtt-aprs.cfg
-Modify this with your information. Add your callsign, your password, and any other filters you are looking to apply.
+/usr/sbin/useradd --system --user-group --no-create-home --shell /usr/sbin/nologin mqtt-aprs
 
-sudo cp /usr/local/mqtt-aprs/mqtt-aprs.default /etc/default/mqtt-aprs
-sudo cp /usr/local/mqtt-aprs/mqtt-aprs.service /lib/systemd/system/
+
+Download this repo:
+
+git clone https://github.com/JohnCanty/mqtt-aprs /opt/mqtt-aprs
+chown -R mqtt-aprs:mqtt-aprs /opt/mqtt-aprs
+
+Create the Virtual environment also adding dependencies:
+
+python3 -m venv /opt/mqtt-aprs/venv
+/opt/mqtt-aprs/venv/bin/pip install --upgrade pip setuptools
+/opt/mqtt-aprs/venv/bin/pip install setproctitle paho-mqtt aprslib configparser
+
+
+Move the config file to an expected location:
+
+mkdir -p /etc/mqtt-aprs
+cp /opt/mqtt-aprs/mqtt-aprs.cfg.example /etc/mqtt-aprs/mqtt-aprs.cfg
+chown -R mqtt-aprs:mqtt-aprs /etc/mqtt-aprs
+
+
+Edit your config:
+- You may find that you want more control of where things are published - some code edits should be done only after initial startup.
+
+nano /etc/mqtt-aprs/mqtt-aprs.cfg
+
+Setup the logs:
+
+touch /var/log/mqtt-aprs.log
+chown mqtt-aprs:mqtt-aprs /var/log/mqtt-aprs.log
+chmod 640 /var/log/mqtt-aprs.log
+
+
+Create the service:
+
+cat >/etc/systemd/system/mqtt-aprs.service <<'EOF'
+[Unit]
+Description=mqtt-aprs service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mqtt-aprs
+Group=mqtt-aprs
+WorkingDirectory=/opt/mqtt-aprs
+ExecStart=/opt/mqtt-aprs/venv/bin/python /opt/mqtt-aprs/mqtt-aprs.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
 ```
 Load the Systemd service file:
 `sudo systemctl daemon-reload`
+`systemctl enable --now mqtt-aprs`
 
-Enable the service:
-`sudo systemctl enable mqtt-aprs`
-
-Start the service:
-`sudo systemctl start mqtt-aprs`
 
 APRS is a registered trademark Bob Bruninga, WB4APR
 
