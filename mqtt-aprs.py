@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: iso-8859-1 -*-
 
-__author__ = "Mike Loebl"
-__copyright__ = "Copyright (C) Mike Loebl"
+__author__ = "John Canty"
+__copyright__ = "None"
 
 # Script based on mqtt-owfs-temp written by Kyle Gordon and converted for use with APRS
 # Source: https://github.com/kylegordon/mqtt-owfs-temp
 # APRS is a registered trademark Bob Bruninga, WB4APR
+# Source: Mike Lobel Heavily modified to use Paho callback V2 and search for common aprs ports on the server.
 
 import os
 import logging
@@ -36,7 +37,7 @@ LOGFILE = config.get("global", "logfile")
 MQTT_HOST = config.get("global", "mqtt_host")
 MQTT_PORT = config.getint("global", "mqtt_port")
 MQTT_SUBTOPIC = config.get("global", "MQTT_SUBTOPIC")
-MQTT_TOPIC = "/raw/" + socket.getfqdn() + "/" + MQTT_SUBTOPIC
+MQTT_TOPIC = "RF" + "/" + MQTT_SUBTOPIC
 MQTT_USERNAME = config.get("global", "MQTT_USERNAME")
 MQTT_PASSWORD = config.get("global", "MQTT_PASSWORD")
 METRICUNITS = config.get("global", "METRICUNITS")
@@ -44,19 +45,23 @@ METRICUNITS = config.get("global", "METRICUNITS")
 APRS_CALLSIGN = config.get("global", "APRS_CALLSIGN")
 APRS_PASSWORD = config.get("global", "APRS_PASSWORD")
 APRS_HOST = config.get("global", "APRS_HOST")
-APRS_PORT = config.get("global", "APRS_PORT")
+APRS_PORT = config.getint("global", "APRS_PORT")  # Convert to int
 APRS_FILTER = config.get("global", "APRS_FILTER")
 APRS_PROCESS = config.get("global", "APRS_PROCESS")
 
 APRS_LATITUDE = config.get("global", "APRS_LATITUDE")
 APRS_LONGITUDE = config.get("global", "APRS_LONGITUDE")
 
+# Common APRS ports to try if the configured one fails
+COMMON_APRS_PORTS = [14580, 10152, 14581]
+
 APPNAME = MQTT_SUBTOPIC
-PRESENCETOPIC = "clients/" + socket.getfqdn() + "/" + APPNAME + "/state"
+PRESENCETOPIC = "RF/" + MQTT_SUBTOPIC + "/state"
 setproctitle.setproctitle(APPNAME)
 client_id = APPNAME + "_%d" % os.getpid()
 
-mqttc = paho.Client()
+# Updated to use the latest callback API version
+mqttc = paho.Client(paho.CallbackAPIVersion.VERSION2, client_id=client_id, clean_session=True, userdata=None, protocol=paho.MQTTv311, transport="tcp")
 
 LOGFORMAT = '%(asctime)-15s %(message)s'
 
@@ -81,28 +86,28 @@ def farenheitCon(celsius):
 # All the MQTT callbacks start here
 
 
-def on_publish(mosq, obj, mid):
+def on_publish(client, userdata, mid, reason_codes, properties):
     """
     What to do when a message is published
     """
     logging.debug("MID " + str(mid) + " published.")
 
 
-def on_subscribe(mosq, obj, mid, qos_list):
+def on_subscribe(client, userdata, mid, reason_codes_list, properties):
     """
     What to do in the event of subscribing to a topic"
     """
     logging.debug("Subscribe with mid " + str(mid) + " received.")
 
 
-def on_unsubscribe(mosq, obj, mid):
+def on_unsubscribe(client, userdata, mid, properties, reason_codes_list):
     """
     What to do in the event of unsubscribing from a topic
     """
     logging.debug("Unsubscribe with mid " + str(mid) + " received.")
 
 
-def on_connect(self, mosq, obj, result_code):
+def on_connect(client, userdata, flags, reason_code, properties):
     """
     Handle connections (or failures) to the broker.
     This is called after the client has received a CONNACK message
@@ -115,58 +120,58 @@ def on_connect(self, mosq, obj, result_code):
     4: Refused – bad user name or password (MQTT v3.1 broker only)
     5: Refused – not authorised (MQTT v3.1 broker only)
     """
-    logging.debug("on_connect RC: " + str(result_code))
-    if result_code == 0:
+    logging.debug("on_connect RC: " + str(reason_code))
+    if reason_code == 0:
         logging.info("Connected to %s:%s", MQTT_HOST, MQTT_PORT)
         # Publish retained LWT as per
         # http://stackoverflow.com/q/97694
         # See also the will_set function in connect() below
         mqttc.publish(PRESENCETOPIC, "1", retain=True)
         process_connection()
-    elif result_code == 1:
+    elif reason_code == 1:
         logging.info("Connection refused - unacceptable protocol version")
-        cleanup()
-    elif result_code == 2:
+        cleanup(None, None)
+    elif reason_code == 2:
         logging.info("Connection refused - identifier rejected")
-        cleanup()
-    elif result_code == 3:
+        cleanup(None, None)
+    elif reason_code == 3:
         logging.info("Connection refused - server unavailable")
         logging.info("Retrying in 30 seconds")
         time.sleep(30)
-    elif result_code == 4:
+    elif reason_code == 4:
         logging.info("Connection refused - bad user name or password")
-        cleanup()
-    elif result_code == 5:
+        cleanup(None, None)
+    elif reason_code == 5:
         logging.info("Connection refused - not authorised")
-        cleanup()
+        cleanup(None, None)
     else:
-        logging.warning("Something went wrong. RC:" + str(result_code))
-        cleanup()
+        logging.warning("Something went wrong. RC:" + str(reason_code))
+        cleanup(None, None)
 
 
-def on_disconnect(mosq, obj, result_code):
+def on_disconnect(client, userdata, flags, reason_code, properties):
     """
     Handle disconnections from the broker
     """
-    if result_code == 0:
+    if reason_code == 0:
         logging.info("Clean disconnection")
     else:
         logging.info("Unexpected disconnection! Reconnecting in 5 seconds")
-        logging.debug("Result code: %s", result_code)
+        logging.debug("Reason code: %s", reason_code)
         time.sleep(5)
 
 
-def on_message(mosq, obj, msg):
+def on_message(client, userdata, msg):
     """
     What to do when the client recieves a message from the broker
     """
-    logging.debug("Received: " + msg.payload +
+    logging.debug("Received: " + msg.payload.decode('utf-8') +
                   " received on topic " + msg.topic +
                   " with QoS " + str(msg.qos))
-    process_message(msg)
+    process_message(client, userdata, msg)
 
 
-def on_log(mosq, obj, level, string):
+def on_log(client, userdata, level, string):
     """
     What to do with debug log output from the MQTT library
     """
@@ -229,7 +234,7 @@ def process_connection():
     logging.debug("Processing connection")
 
 
-def process_message(mosq, obj, msg):
+def process_message(client, userdata, msg):
     """
     What to do with the message that's arrived
     """
@@ -246,7 +251,7 @@ def find_in_sublists(lst, value):
     raise ValueError("%s is not in lists" % value)
 
 def callback(packet):
-    logging.debug("Raw Packet: %s", packet)
+    logging.debug("APRS callback received packet: %s", packet)
 
     if APRS_PROCESS == "True":
         aprspacket = aprs._parse(packet)
@@ -353,44 +358,64 @@ def get_distance(inlat, inlon):
         return round(distance, 2)
 
 def aprs_connect():
-
-
-    # Listen for specific packet
-    aprs.set_filter(APRS_FILTER)
-
-    # Open the APRS connection to the server  
-    aprs.connect(blocking=True)
-
-    logging.debug("APRS Processing: %s", APRS_PROCESS)
-    # Set a callback for when a packet is received
-    if APRS_PROCESS == "True":
-        aprs.consumer(callback, raw=True)
+    """Connect to APRS-IS with fallback to common ports"""
+    global aprs
+    
+    # List of ports to try: configured port first, then common ports
+    ports_to_try = [APRS_PORT] + [port for port in COMMON_APRS_PORTS if port != APRS_PORT]
+    
+    for port in ports_to_try:
+        try:
+            logging.info("Attempting to connect to APRS-IS server %s:%d", APRS_HOST, port)
+            
+            # Create a new APRS connection for this attempt
+            aprs = aprslib.IS(APRS_CALLSIGN,
+                            passwd=APRS_PASSWORD,
+                            host=APRS_HOST,
+                            port=port,
+                            skip_login=False)
+            
+            # Listen for specific packet
+            aprs.set_filter(APRS_FILTER)
+            
+            # Try to connect
+            aprs.connect(blocking=True)
+            
+            # If we get here, connection succeeded
+            logging.info("Successfully connected to APRS-IS server %s:%d", APRS_HOST, port)
+            
+            # Start consuming packets
+            logging.debug("APRS Processing: %s", APRS_PROCESS)
+            if APRS_PROCESS == "True":
+                aprs.consumer(callback, raw=True)
+            else:
+                aprs.consumer(callback)
+                
+            # If we successfully start consuming, break out of the loop
+            break
+            
+        except aprslib.exceptions.ConnectionDrop:
+            logging.warning("Connection to APRS server %s:%d dropped", APRS_HOST, port)
+        except aprslib.exceptions.ConnectionError as e:
+            logging.warning("Failed to connect to APRS server %s:%d - %s", APRS_HOST, port, str(e))
+        except Exception as e:
+            logging.error("Unexpected error connecting to APRS server %s:%d - %s", APRS_HOST, port, str(e))
+    
+    # If we've tried all ports and none worked
     else:
-        aprs.consumer(callback)
+        logging.error("Failed to connect to APRS-IS server on any of the attempted ports: %s", ports_to_try)
+        logging.info("Retrying in 30 seconds...")
+        time.sleep(30)
+        aprs_connect()  # Retry the whole process
                     
 # Use the signal module to handle signals
 signal.signal(signal.SIGTERM, cleanup)
 signal.signal(signal.SIGINT, cleanup)
 try:
-    # Prepare the APRS connection
-    aprs = aprslib.IS(APRS_CALLSIGN,
-                    passwd=APRS_PASSWORD,
-                    host=APRS_HOST,
-                    port=APRS_PORT,
-                    skip_login=False)
-
-# Connect to the broker and enter the main loop
+    # Connect to the broker and enter the main loop
     connect()
     aprs_connect()
 
 except KeyboardInterrupt:
     logging.info("Interrupted by keypress")
     sys.exit(0)
-except aprslib.exceptions.ConnectionDrop:
-    logging.info("Connection to APRS server dropped, trying again in 30 seconds...")
-    time.sleep(30)
-    aprs_connect
-except aprslib.exceptions.ConnectionError:
-    logging.info("Connection to APRS server failed, trying again in 30 seconds...")
-    time.sleep(30)
-    aprs_connect    
