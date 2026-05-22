@@ -31,7 +31,7 @@ Create the Virtual environment also adding dependencies:
 
 python3 -m venv /opt/mqtt-aprs/venv
 /opt/mqtt-aprs/venv/bin/pip install --upgrade pip setuptools
-/opt/mqtt-aprs/venv/bin/pip install setproctitle paho-mqtt aprslib configparser
+/opt/mqtt-aprs/venv/bin/pip install setproctitle paho-mqtt aprslib
 
 
 Move the config file to an expected location:
@@ -46,6 +46,10 @@ Edit your config:
 
 nano /etc/mqtt-aprs/mqtt-aprs.cfg
 
+Validate the config before starting the service:
+
+/opt/mqtt-aprs/venv/bin/python /opt/mqtt-aprs/mqtt-aprs.py --check-config
+
 Setup the logs:
 
 touch /var/log/mqtt-aprs.log
@@ -53,30 +57,18 @@ chown mqtt-aprs:mqtt-aprs /var/log/mqtt-aprs.log
 chmod 640 /var/log/mqtt-aprs.log
 
 
-Create the service:
+Install the service file:
 
-cat >/etc/systemd/system/mqtt-aprs.service <<'EOF'
-[Unit]
-Description=mqtt-aprs service
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=mqtt-aprs
-Group=mqtt-aprs
-WorkingDirectory=/opt/mqtt-aprs
-ExecStart=/opt/mqtt-aprs/venv/bin/python /opt/mqtt-aprs/mqtt-aprs.py
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
+cp /opt/mqtt-aprs/mqtt-aprs.service /etc/systemd/system/mqtt-aprs.service
 ```
 Load the Systemd service file:
 `sudo systemctl daemon-reload`
 `systemctl enable --now mqtt-aprs`
+
+Runtime notes:
+- The script looks for `/etc/mqtt-aprs/mqtt-aprs.cfg` by default.
+- You can override the config path with `--config /path/to/mqtt-aprs.cfg` or the `MQTT_APRS_CONFIG` environment variable.
+- The MQTT publish base is `RF/<MQTT_SUBTOPIC>`.
 
 
 APRS is a registered trademark Bob Bruninga, WB4APR

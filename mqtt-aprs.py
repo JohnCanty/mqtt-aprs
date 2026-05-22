@@ -1,421 +1,700 @@
 #!/usr/bin/env python3
-# -*- coding: iso-8859-1 -*-
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
 
 __author__ = "John Canty"
 __copyright__ = "None"
 
-# Script based on mqtt-owfs-temp written by Kyle Gordon and converted for use with APRS
-# Source: https://github.com/kylegordon/mqtt-owfs-temp
-# APRS is a registered trademark Bob Bruninga, WB4APR
-# Source: Mike Lobel Heavily modified to use Paho callback V2 and search for common aprs ports on the server.
-
-import os
-import logging
-import signal
-import socket
-import time
-import sys
-import binascii
-
-import paho.mqtt.client as paho
+import argparse
 import configparser
+import importlib
+import json
+import logging
+import os
+import signal
+import sys
+import time
+from dataclasses import dataclass
+from math import atan2, cos, radians, sin, sqrt
+from pathlib import Path
+from threading import Event
+from typing import Any
 
-import setproctitle
-
-import aprslib
-
-from datetime import datetime, timedelta
-
-# Read the config file
-config = configparser.RawConfigParser()
-# TODO: Fix path: 
-config.read("/etc/mqtt-aprs/mqtt-aprs.cfg")
-
-# Use ConfigParser to pick out the settings
-DEBUG = config.getboolean("global", "debug")
-LOGFILE = config.get("global", "logfile")
-MQTT_HOST = config.get("global", "mqtt_host")
-MQTT_PORT = config.getint("global", "mqtt_port")
-MQTT_SUBTOPIC = config.get("global", "MQTT_SUBTOPIC")
-MQTT_TOPIC = "RF" + "/" + MQTT_SUBTOPIC
-MQTT_USERNAME = config.get("global", "MQTT_USERNAME")
-MQTT_PASSWORD = config.get("global", "MQTT_PASSWORD")
-METRICUNITS = config.get("global", "METRICUNITS")
-
-APRS_CALLSIGN = config.get("global", "APRS_CALLSIGN")
-APRS_PASSWORD = config.get("global", "APRS_PASSWORD")
-APRS_HOST = config.get("global", "APRS_HOST")
-APRS_PORT = config.getint("global", "APRS_PORT")  # Convert to int
-APRS_FILTER = config.get("global", "APRS_FILTER")
-APRS_PROCESS = config.get("global", "APRS_PROCESS")
-
-APRS_LATITUDE = config.get("global", "APRS_LATITUDE")
-APRS_LONGITUDE = config.get("global", "APRS_LONGITUDE")
-
-# Common APRS ports to try if the configured one fails
-COMMON_APRS_PORTS = [14580, 10152, 14581]
-
-APPNAME = MQTT_SUBTOPIC
-PRESENCETOPIC = "RF/" + MQTT_SUBTOPIC + "/state"
-setproctitle.setproctitle(APPNAME)
-client_id = APPNAME + "_%d" % os.getpid()
-
-# Updated to use the latest callback API version
-mqttc = paho.Client(paho.CallbackAPIVersion.VERSION2, client_id=client_id, clean_session=True, userdata=None, protocol=paho.MQTTv311, transport="tcp")
-
-LOGFORMAT = '%(asctime)-15s %(message)s'
-
-if DEBUG:
-    logging.basicConfig(filename=LOGFILE,
-                        level=logging.DEBUG,
-                        format=LOGFORMAT)
-else:
-    logging.basicConfig(filename=LOGFILE,
-                        level=logging.INFO,
-                        format=LOGFORMAT)
-
-logging.info("Starting " + APPNAME)
-logging.info("INFO MODE")
-logging.debug("DEBUG MODE")
-
-def celsiusCon(farenheit):
-    return (farenheit - 32)*(5/9)
-def farenheitCon(celsius):
-    return ((celsius*(9/5)) + 32)
-
-# All the MQTT callbacks start here
+def load_optional_module(module_name: str) -> tuple[Any, ImportError | None]:
+    try:
+        return importlib.import_module(module_name), None
+    except ImportError as exc:
+        return None, exc
 
 
-def on_publish(client, userdata, mid, reason_codes, properties):
-    """
-    What to do when a message is published
-    """
-    logging.debug("MID " + str(mid) + " published.")
+aprslib, APRSLIB_IMPORT_ERROR = load_optional_module("aprslib")
+paho, PAHO_IMPORT_ERROR = load_optional_module("paho.mqtt.client")
+setproctitle, _ = load_optional_module("setproctitle")
 
 
-def on_subscribe(client, userdata, mid, reason_codes_list, properties):
-    """
-    What to do in the event of subscribing to a topic"
-    """
-    logging.debug("Subscribe with mid " + str(mid) + " received.")
+DEFAULT_CONFIG_PATH = Path("/etc/mqtt-aprs/mqtt-aprs.cfg")
+LOCAL_CONFIG_PATH = Path(__file__).with_name("mqtt-aprs.cfg")
+COMMON_APRS_PORTS = (14580, 10152, 14581)
+MQTT_CONNECT_TIMEOUT_SECONDS = 15
+MQTT_RETRY_SECONDS = 10
+APRS_RETRY_SECONDS = 30
+LOGFORMAT = "%(asctime)-15s %(levelname)s %(message)s"
 
 
-def on_unsubscribe(client, userdata, mid, properties, reason_codes_list):
-    """
-    What to do in the event of unsubscribing from a topic
-    """
-    logging.debug("Unsubscribe with mid " + str(mid) + " received.")
+class ConfigError(ValueError):
+    pass
 
 
-def on_connect(client, userdata, flags, reason_code, properties):
-    """
-    Handle connections (or failures) to the broker.
-    This is called after the client has received a CONNACK message
-    from the broker in response to calling connect().
-    The parameter rc is an integer giving the return code:
-    0: Success
-    1: Refused – unacceptable protocol version
-    2: Refused – identifier rejected
-    3: Refused – server unavailable
-    4: Refused – bad user name or password (MQTT v3.1 broker only)
-    5: Refused – not authorised (MQTT v3.1 broker only)
-    """
-    logging.debug("on_connect RC: " + str(reason_code))
-    if reason_code == 0:
-        logging.info("Connected to %s:%s", MQTT_HOST, MQTT_PORT)
-        # Publish retained LWT as per
-        # http://stackoverflow.com/q/97694
-        # See also the will_set function in connect() below
-        mqttc.publish(PRESENCETOPIC, "1", retain=True)
-        process_connection()
-    elif reason_code == 1:
-        logging.info("Connection refused - unacceptable protocol version")
-        cleanup(None, None)
-    elif reason_code == 2:
-        logging.info("Connection refused - identifier rejected")
-        cleanup(None, None)
-    elif reason_code == 3:
-        logging.info("Connection refused - server unavailable")
-        logging.info("Retrying in 30 seconds")
-        time.sleep(30)
-    elif reason_code == 4:
-        logging.info("Connection refused - bad user name or password")
-        cleanup(None, None)
-    elif reason_code == 5:
-        logging.info("Connection refused - not authorised")
-        cleanup(None, None)
-    else:
-        logging.warning("Something went wrong. RC:" + str(reason_code))
-        cleanup(None, None)
+@dataclass(frozen=True)
+class Settings:
+    debug: bool
+    logfile: str
+    mqtt_host: str
+    mqtt_port: int
+    mqtt_subtopic: str
+    mqtt_username: str
+    mqtt_password: str
+    metric_units: bool
+    aprs_callsign: str
+    aprs_password: str
+    aprs_host: str
+    aprs_port: int
+    aprs_filter: str
+    aprs_process: bool
+    aprs_latitude: float | None
+    aprs_longitude: float | None
+
+    @property
+    def app_name(self) -> str:
+        return self.mqtt_subtopic
+
+    @property
+    def mqtt_topic(self) -> str:
+        return f"RF/{self.mqtt_subtopic}"
+
+    @property
+    def presence_topic(self) -> str:
+        return f"{self.mqtt_topic}/state"
+
+    @property
+    def aprs_ports_to_try(self) -> tuple[int, ...]:
+        ports = [self.aprs_port]
+        ports.extend(port for port in COMMON_APRS_PORTS if port != self.aprs_port)
+        return tuple(ports)
 
 
-def on_disconnect(client, userdata, flags, reason_code, properties):
-    """
-    Handle disconnections from the broker
-    """
-    if reason_code == 0:
-        logging.info("Clean disconnection")
-    else:
-        logging.info("Unexpected disconnection! Reconnecting in 5 seconds")
-        logging.debug("Reason code: %s", reason_code)
-        time.sleep(5)
+def normalize_text(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
 
 
-def on_message(client, userdata, msg):
-    """
-    What to do when the client recieves a message from the broker
-    """
-    logging.debug("Received: " + msg.payload.decode('utf-8') +
-                  " received on topic " + msg.topic +
-                  " with QoS " + str(msg.qos))
-    process_message(client, userdata, msg)
+def parse_legacy_bool(value: Any, *, default: bool) -> bool:
+    normalized = normalize_text(value).lower()
+    if not normalized:
+        return default
+
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise ConfigError(f"Invalid boolean value: {value!r}")
 
 
-def on_log(client, userdata, level, string):
-    """
-    What to do with debug log output from the MQTT library
-    """
-    logging.debug(string)
+def parse_optional_int(value: Any, *, option_name: str, default: int | None = None) -> int | None:
+    normalized = normalize_text(value)
+    if not normalized:
+        return default
 
-# End of MQTT callbacks
-
-
-def cleanup(signum, frame):
-    """
-    Signal handler to ensure we disconnect cleanly
-    in the event of a SIGTERM or SIGINT.
-    """
-    logging.info("Disconnecting from broker")
-    # Publish a retained message to state that this client is offline
-    mqttc.publish(PRESENCETOPIC, "0", retain=True)
-    mqttc.disconnect()
-    mqttc.loop_stop()
-    logging.info("Exiting on signal %d", signum)
-    sys.exit(signum)
-
-def connect():
-    """
-    Connect to the broker, define the callbacks, and subscribe
-    This will also set the Last Will and Testament (LWT)
-    The LWT will be published in the event of an unclean or
-    unexpected disconnection.
-    """
-    logging.info("Connecting to %s:%s", MQTT_HOST, MQTT_PORT)
-
-    if MQTT_USERNAME:
-        logging.info("Found username %s", MQTT_USERNAME)
-        mqttc.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-
-    # Set the Last Will and Testament (LWT) *before* connecting
-    mqttc.will_set(PRESENCETOPIC, "0", qos=0, retain=True)
-    result = mqttc.connect(MQTT_HOST, MQTT_PORT, 60)
-    if result != 0:
-        logging.info("Connection failed with error code %s. Retrying", result)
-        
-        time.sleep(10)
-        connect()
-
-    # Define the callbacks
-    mqttc.on_connect = on_connect
-    mqttc.on_disconnect = on_disconnect
-    mqttc.on_publish = on_publish
-    mqttc.on_subscribe = on_subscribe
-    mqttc.on_unsubscribe = on_unsubscribe
-    mqttc.on_message = on_message
-    if DEBUG:
-        mqttc.on_log = on_log
-
-    mqttc.loop_start()
-
-def process_connection():
-    """
-    What to do when a new connection is established
-    """
-    logging.debug("Processing connection")
+    try:
+        return int(normalized)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid integer for {option_name}: {value!r}") from exc
 
 
-def process_message(client, userdata, msg):
-    """
-    What to do with the message that's arrived
-    """
-    logging.debug("Received: %s", msg.topic)
+def parse_optional_float(value: Any, *, option_name: str) -> float | None:
+    normalized = normalize_text(value)
+    if not normalized:
+        return None
+
+    try:
+        return float(normalized)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid float for {option_name}: {value!r}") from exc
 
 
-def find_in_sublists(lst, value):
-    for sub_i, sublist in enumerate(lst):
+def get_config_value(config: configparser.RawConfigParser, option_name: str, *, default: str = "") -> str:
+    if not config.has_option("global", option_name):
+        return default
+    return config.get("global", option_name)
+
+
+def get_required_config_value(config: configparser.RawConfigParser, option_name: str) -> str:
+    value = normalize_text(get_config_value(config, option_name))
+    if not value:
+        raise ConfigError(f"Missing required [global] option {option_name}")
+    return value
+
+
+def resolve_config_path(explicit_path: str | None) -> Path:
+    if explicit_path:
+        config_path = Path(explicit_path).expanduser()
+        if config_path.is_file():
+            return config_path
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    env_path = os.getenv("MQTT_APRS_CONFIG")
+    if env_path:
+        config_path = Path(env_path).expanduser()
+        if config_path.is_file():
+            return config_path
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    for config_path in (DEFAULT_CONFIG_PATH, LOCAL_CONFIG_PATH):
+        if config_path.is_file():
+            return config_path
+
+    raise FileNotFoundError(
+        "No config file found. Checked /etc/mqtt-aprs/mqtt-aprs.cfg and a local mqtt-aprs.cfg."
+    )
+
+
+def load_settings(config_path: Path) -> Settings:
+    config = configparser.RawConfigParser()
+    if not config.read(config_path):
+        raise FileNotFoundError(f"Unable to read config file: {config_path}")
+
+    if not config.has_section("global"):
+        raise ConfigError("Config file is missing the [global] section")
+
+    mqtt_subtopic = get_required_config_value(config, "MQTT_SUBTOPIC").strip("/")
+    if not mqtt_subtopic:
+        raise ConfigError("MQTT_SUBTOPIC must not be empty")
+
+    aprs_latitude = parse_optional_float(
+        get_config_value(config, "APRS_LATITUDE"),
+        option_name="APRS_LATITUDE",
+    )
+    aprs_longitude = parse_optional_float(
+        get_config_value(config, "APRS_LONGITUDE"),
+        option_name="APRS_LONGITUDE",
+    )
+
+    if (aprs_latitude is None) != (aprs_longitude is None):
+        raise ConfigError("APRS_LATITUDE and APRS_LONGITUDE must be set together")
+
+    mqtt_port = parse_optional_int(
+        get_config_value(config, "MQTT_PORT"),
+        option_name="MQTT_PORT",
+        default=1883,
+    )
+    aprs_port = parse_optional_int(
+        get_config_value(config, "APRS_PORT"),
+        option_name="APRS_PORT",
+        default=COMMON_APRS_PORTS[0],
+    )
+
+    if mqtt_port is None or aprs_port is None:
+        raise ConfigError("MQTT_PORT and APRS_PORT must resolve to valid integers")
+
+    return Settings(
+        debug=parse_legacy_bool(get_config_value(config, "DEBUG"), default=False),
+        logfile=normalize_text(get_config_value(config, "LOGFILE")),
+        mqtt_host=get_required_config_value(config, "MQTT_HOST"),
+        mqtt_port=mqtt_port,
+        mqtt_subtopic=mqtt_subtopic,
+        mqtt_username=normalize_text(get_config_value(config, "MQTT_USERNAME")),
+        mqtt_password=normalize_text(get_config_value(config, "MQTT_PASSWORD")),
+        metric_units=parse_legacy_bool(get_config_value(config, "METRICUNITS"), default=False),
+        aprs_callsign=get_required_config_value(config, "APRS_CALLSIGN"),
+        aprs_password=normalize_text(get_config_value(config, "APRS_PASSWORD", default="-1")) or "-1",
+        aprs_host=get_required_config_value(config, "APRS_HOST"),
+        aprs_port=aprs_port,
+        aprs_filter=normalize_text(get_config_value(config, "APRS_FILTER")),
+        aprs_process=parse_legacy_bool(get_config_value(config, "APRS_PROCESS"), default=True),
+        aprs_latitude=aprs_latitude,
+        aprs_longitude=aprs_longitude,
+    )
+
+
+def configure_logging(settings: Settings) -> None:
+    basic_config_kwargs: dict[str, Any] = {
+        "format": LOGFORMAT,
+        "level": logging.DEBUG if settings.debug else logging.INFO,
+        "force": True,
+    }
+
+    if settings.logfile:
         try:
-            return (sub_i, sublist.index(value))
-        except ValueError:
-            pass
-
-    raise ValueError("%s is not in lists" % value)
-
-def callback(packet):
-    logging.debug("APRS callback received packet: %s", packet)
-
-    if APRS_PROCESS == "True":
-        aprspacket = aprs._parse(packet)
-
-        ssid = aprspacket.get('from', None)
-        logging.debug("SSID: %s", ssid)
-
-
-        rawpacket = aprspacket.get('raw', None)
-        logging.debug("RAW: %s",  rawpacket)
-        publish_aprstomqtt(ssid, "raw", rawpacket)
-
-        aprspath = aprspacket.get('path', None)
-        if aprspath:
-            logging.debug("path: %s", aprspath)
-            publish_aprstomqtt(ssid, "path",aprspath)
-
-
-        packet_format = aprspacket.get('format', None)
-        logging.debug("format: %s",  packet_format)
-        publish_aprstomqtt(ssid, "format", packet_format)
-        
-        symbol_table = aprspacket.get('symbol_table', None)
-        symbol = aprspacket.get('symbol', None)
-        
-        if symbol_table and symbol:
-            icon = symbol_table + symbol
-            logging.debug("icon: %s", icon)
-            publish_aprstomqtt(ssid, "icon", icon)
-
-        aprs_lat = aprspacket.get('latitude', None)
-        aprs_lon = aprspacket.get('longitude', None)
-        if aprs_lat and aprs_lon:
-            aprs_lat = round(aprs_lat, 4)
-            aprs_lon = round(aprs_lon, 4)
-            logging.debug("latitude: %s",  aprs_lat)
-            logging.debug("longitude: %s",  aprs_lon)
-            distance = get_distance(aprs_lat, aprs_lon)
-            publish_aprstomqtt(ssid, "latitude", aprs_lat)
-            publish_aprstomqtt(ssid, "longitude",aprs_lon)
-
-            logging.debug("Distance away: %s", distance)
-            publish_aprstomqtt(ssid, "distance",distance)
-
-        altitude = aprspacket.get('altitude', None)
-        if altitude:
-            if METRICUNITS == "0":
-                altitude = altitude / 0.3048
-            logging.debug("altitude: %s", round(altitude, 0))
-            publish_aprstomqtt(ssid, "altitude",round(altitude, 0))
-
-        comment = aprspacket.get('comment', None)
-        if comment:
-            logging.debug("comment: %s", comment)
-            publish_aprstomqtt(ssid, "comment",comment)
-
-        telemetry = aprspacket.get('telemetry', None)
-        if telemetry:
-            logging.debug("telemetry: %s", telemetry)
-            publish_aprstomqtt(ssid, "telemetry",telemetry)
-            
-        message = aprspacket.get('message_text', None)
-        if message:
-            logging.debug("message: %s", message)
-            publish_aprstomqtt(ssid, "message",message)
+            logging.basicConfig(filename=settings.logfile, **basic_config_kwargs)
+        except OSError as exc:
+            logging.basicConfig(stream=sys.stderr, **basic_config_kwargs)
+            logging.warning(
+                "Failed to open log file %s: %s. Falling back to stderr.",
+                settings.logfile,
+                exc,
+            )
     else:
-        publish_aprstomqtt_nossid(packet)    
+        logging.basicConfig(stream=sys.stderr, **basic_config_kwargs)
 
 
-def publish_aprstomqtt(inssid, inname, invalue):
-    topic_path = MQTT_TOPIC + "/" + inssid + "/" + inname
-    logging.debug("Publishing topic: %s with value %s" % (topic_path, invalue))
-    mqttc.publish(topic_path, str(invalue).encode('utf-8').strip())
+def ensure_runtime_dependencies() -> None:
+    missing_packages = []
 
-def publish_aprstomqtt_nossid(invalue):
-    topic_path = MQTT_TOPIC
-    logging.debug("Publishing topic: %s with value %s" % (topic_path, invalue))
-    mqttc.publish(topic_path, str(invalue).encode('utf-8').strip())
+    if paho is None:
+        missing_packages.append(f"paho-mqtt ({PAHO_IMPORT_ERROR})")
+    if aprslib is None:
+        missing_packages.append(f"aprslib ({APRSLIB_IMPORT_ERROR})")
+
+    if missing_packages:
+        raise RuntimeError(
+            "Missing required Python packages: " + ", ".join(missing_packages)
+        )
 
 
-def get_distance(inlat, inlon):
-    if APRS_LATITUDE and APRS_LONGITUDE:
-        # From: https://stackoverflow.com/questions/19412462/getting-distance-between-two-points-based-on-latitude-longitude
-        # approximate radius of earth in km
-        R = 6373.0
+def decode_packet(packet: bytes | str) -> str:
+    if isinstance(packet, bytes):
+        return packet.decode("latin-1", errors="replace").strip()
+    return str(packet).strip()
 
-        from math import sin, cos, sqrt, atan2, radians    
-        lat1 = radians(float(APRS_LATITUDE))
-        lon1 = radians(float(APRS_LONGITUDE))
-        lat2 = radians(float(inlat))
-        lon2 = radians(float(inlon))
 
-        dlon = lon2 - lon1
-        dlat = lat2 - lat1
+def mqtt_payload(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True)
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(item) for item in value)
+    if isinstance(value, bool):
+        return json.dumps(value)
+    return str(value).strip()
 
-        a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
+
+def reason_code_value(reason_code: Any) -> Any:
+    return getattr(reason_code, "value", reason_code)
+
+
+class MqttAprsBridge:
+    def __init__(self, settings: Settings):
+        ensure_runtime_dependencies()
+        self.settings = settings
+        self.stop_event = Event()
+        self.mqtt_connected = Event()
+        self.mqtt_connection_state = Event()
+        self.mqtt_connect_result: Any = None
+        self.mqtt_loop_started = False
+        self.aprs_client: Any | None = None
+        self.mqtt_client = self.build_mqtt_client()
+
+    def build_mqtt_client(self) -> Any:
+        client_id = f"{self.settings.app_name}_{os.getpid()}"
+        client = paho.Client(
+            paho.CallbackAPIVersion.VERSION2,
+            client_id=client_id,
+            clean_session=True,
+            userdata=None,
+            protocol=paho.MQTTv311,
+            transport="tcp",
+        )
+
+        if self.settings.mqtt_username:
+            client.username_pw_set(self.settings.mqtt_username, self.settings.mqtt_password or None)
+
+        client.will_set(self.settings.presence_topic, "0", qos=0, retain=True)
+        client.reconnect_delay_set(min_delay=5, max_delay=60)
+        client.on_connect = self.on_mqtt_connect
+        client.on_disconnect = self.on_mqtt_disconnect
+        client.on_publish = self.on_mqtt_publish
+
+        if self.settings.debug:
+            client.enable_logger(logging.getLogger("paho.mqtt"))
+
+        return client
+
+    def on_mqtt_connect(self, client: Any, userdata: Any, flags: Any, reason_code: Any, properties: Any) -> None:
+        code = reason_code_value(reason_code)
+        self.mqtt_connect_result = code
+        self.mqtt_connection_state.set()
+
+        if code == 0:
+            self.mqtt_connected.set()
+            logging.info("Connected to MQTT %s:%s", self.settings.mqtt_host, self.settings.mqtt_port)
+            self.publish_presence(True)
+            return
+
+        self.mqtt_connected.clear()
+        logging.error("MQTT connection refused with reason code %s", code)
+
+    def on_mqtt_disconnect(
+        self,
+        client: Any,
+        userdata: Any,
+        disconnect_flags: Any,
+        reason_code: Any,
+        properties: Any,
+    ) -> None:
+        code = reason_code_value(reason_code)
+        self.mqtt_connected.clear()
+
+        if code == 0:
+            logging.info("Clean MQTT disconnection")
+        else:
+            logging.warning(
+                "MQTT disconnected unexpectedly with reason code %s. The network loop will retry.",
+                code,
+            )
+
+    def on_mqtt_publish(self, client: Any, userdata: Any, mid: int, reason_codes: Any, properties: Any) -> None:
+        logging.debug("MQTT message id %s published", mid)
+
+    def connect_mqtt(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                logging.info("Connecting to MQTT %s:%s", self.settings.mqtt_host, self.settings.mqtt_port)
+                self.mqtt_connected.clear()
+                self.mqtt_connection_state.clear()
+                self.mqtt_connect_result = None
+
+                if self.mqtt_loop_started:
+                    result = self.mqtt_client.reconnect()
+                else:
+                    result = self.mqtt_client.connect(self.settings.mqtt_host, self.settings.mqtt_port, 60)
+                    if result == paho.MQTT_ERR_SUCCESS:
+                        self.mqtt_client.loop_start()
+                        self.mqtt_loop_started = True
+
+                if result != paho.MQTT_ERR_SUCCESS:
+                    raise RuntimeError(f"MQTT connect returned error code {result}")
+
+                if not self.mqtt_connection_state.wait(timeout=MQTT_CONNECT_TIMEOUT_SECONDS):
+                    logging.warning(
+                        "Timed out waiting for MQTT connection acknowledgement after %s seconds",
+                        MQTT_CONNECT_TIMEOUT_SECONDS,
+                    )
+                elif self.mqtt_connect_result == 0:
+                    return
+                elif self.mqtt_connect_result in {1, 2, 4, 5}:
+                    raise RuntimeError(
+                        f"MQTT connection failed with non-retryable reason code {self.mqtt_connect_result}"
+                    )
+                else:
+                    logging.warning(
+                        "MQTT connection failed with reason code %s. Retrying.",
+                        self.mqtt_connect_result,
+                    )
+
+                try:
+                    self.mqtt_client.disconnect()
+                except Exception:
+                    logging.debug("MQTT disconnect during retry cleanup failed", exc_info=True)
+            except OSError as exc:
+                logging.warning("MQTT connection attempt failed: %s", exc)
+            except RuntimeError:
+                raise
+
+            if self.stop_event.wait(MQTT_RETRY_SECONDS):
+                break
+
+        raise RuntimeError("Stopping before MQTT connection was established")
+
+    def build_aprs_client(self, port: int) -> Any:
+        client = aprslib.IS(
+            self.settings.aprs_callsign,
+            passwd=self.settings.aprs_password,
+            host=self.settings.aprs_host,
+            port=port,
+            skip_login=False,
+        )
+
+        if self.settings.aprs_filter:
+            client.set_filter(self.settings.aprs_filter)
+
+        return client
+
+    def consume_aprs_forever(self) -> None:
+        while not self.stop_event.is_set():
+            for port in self.settings.aprs_ports_to_try:
+                if self.stop_event.is_set():
+                    return
+
+                try:
+                    logging.info("Connecting to APRS-IS %s:%s", self.settings.aprs_host, port)
+                    client = self.build_aprs_client(port)
+                    self.aprs_client = client
+                    client.connect(blocking=True)
+                    logging.info("Connected to APRS-IS %s:%s", self.settings.aprs_host, port)
+                    client.consumer(self.handle_aprs_packet, blocking=True, raw=True)
+                    logging.warning("APRS consumer exited cleanly. Reconnecting.")
+                except (aprslib.ConnectionDrop, aprslib.ConnectionError) as exc:
+                    logging.warning(
+                        "APRS connection to %s:%s failed or dropped: %s",
+                        self.settings.aprs_host,
+                        port,
+                        exc,
+                    )
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    logging.exception(
+                        "Unexpected APRS error while connected to %s:%s",
+                        self.settings.aprs_host,
+                        port,
+                    )
+                finally:
+                    self.close_aprs_client()
+
+                if self.stop_event.wait(5):
+                    return
+
+            logging.error(
+                "Failed to connect to APRS-IS on ports %s. Retrying in %s seconds.",
+                ", ".join(str(port) for port in self.settings.aprs_ports_to_try),
+                APRS_RETRY_SECONDS,
+            )
+
+            if self.stop_event.wait(APRS_RETRY_SECONDS):
+                return
+
+    def handle_aprs_packet(self, packet: bytes | str) -> None:
+        if self.stop_event.is_set():
+            raise StopIteration
+
+        if not self.settings.aprs_process:
+            self.publish_without_station(packet)
+            return
+
+        try:
+            parsed_packet = aprslib.parse(packet)
+        except (aprslib.ParseError, aprslib.UnknownFormat) as exc:
+            logging.debug("Failed to parse APRS packet: %s", exc)
+            self.publish_without_station(packet)
+            return
+
+        self.publish_parsed_packet(parsed_packet)
+
+    def publish_parsed_packet(self, packet: dict[str, Any]) -> None:
+        station_id = normalize_text(packet.get("from"))
+        raw_packet = packet.get("raw")
+
+        if not station_id:
+            logging.debug("Parsed packet did not include a source callsign: %s", packet)
+            if raw_packet:
+                self.publish_without_station(raw_packet)
+            return
+
+        if raw_packet:
+            self.publish_station_value(station_id, "raw", raw_packet)
+
+        path = packet.get("path")
+        if path:
+            self.publish_station_value(station_id, "path", path)
+
+        packet_format = packet.get("format")
+        if packet_format:
+            self.publish_station_value(station_id, "format", packet_format)
+
+        symbol_table = packet.get("symbol_table")
+        symbol = packet.get("symbol")
+        if symbol_table and symbol:
+            self.publish_station_value(station_id, "icon", f"{symbol_table}{symbol}")
+
+        latitude = packet.get("latitude")
+        longitude = packet.get("longitude")
+        if latitude is not None and longitude is not None:
+            latitude_value = round(float(latitude), 4)
+            longitude_value = round(float(longitude), 4)
+            self.publish_station_value(station_id, "latitude", latitude_value)
+            self.publish_station_value(station_id, "longitude", longitude_value)
+
+            distance = self.get_distance(latitude_value, longitude_value)
+            if distance is not None:
+                self.publish_station_value(station_id, "distance", distance)
+
+        altitude = packet.get("altitude")
+        if altitude is not None:
+            altitude_value = float(altitude)
+            if not self.settings.metric_units:
+                altitude_value /= 0.3048
+            self.publish_station_value(station_id, "altitude", round(altitude_value, 0))
+
+        speed = packet.get("speed")
+        if speed is not None:
+            speed_value = float(speed)
+            if not self.settings.metric_units:
+                speed_value *= 0.621371
+            self.publish_station_value(station_id, "speed", round(speed_value, 2))
+
+        course = packet.get("course")
+        if course is not None:
+            self.publish_station_value(station_id, "course", int(course))
+
+        comment = packet.get("comment")
+        if comment:
+            self.publish_station_value(station_id, "comment", comment)
+
+        telemetry = packet.get("telemetry")
+        if telemetry:
+            self.publish_station_value(station_id, "telemetry", telemetry)
+
+        message_text = packet.get("message_text")
+        if message_text:
+            self.publish_station_value(station_id, "message", message_text)
+
+        status = packet.get("status")
+        if status:
+            self.publish_station_value(station_id, "status", status)
+
+    def publish_station_value(self, station_id: str, field_name: str, value: Any) -> None:
+        topic = f"{self.settings.mqtt_topic}/{station_id}/{field_name}"
+        self.publish(topic, value)
+
+    def publish_without_station(self, value: Any) -> None:
+        self.publish(self.settings.mqtt_topic, decode_packet(value))
+
+    def publish_presence(self, online: bool) -> None:
+        try:
+            result = self.mqtt_client.publish(
+                self.settings.presence_topic,
+                "1" if online else "0",
+                retain=True,
+            )
+            if result.rc != paho.MQTT_ERR_SUCCESS:
+                logging.debug("Presence publish returned rc=%s", result.rc)
+        except Exception:
+            logging.debug("Failed to publish presence state", exc_info=True)
+
+    def publish(self, topic: str, value: Any) -> None:
+        payload = mqtt_payload(value)
+        logging.debug("Publishing topic %s with value %s", topic, payload)
+        result = self.mqtt_client.publish(topic, payload)
+        if result.rc != paho.MQTT_ERR_SUCCESS:
+            logging.warning("Failed to publish topic %s: rc=%s", topic, result.rc)
+
+    def get_distance(self, latitude: float, longitude: float) -> float | None:
+        if self.settings.aprs_latitude is None or self.settings.aprs_longitude is None:
+            return None
+
+        earth_radius_km = 6371.0088
+        lat1 = radians(self.settings.aprs_latitude)
+        lon1 = radians(self.settings.aprs_longitude)
+        lat2 = radians(float(latitude))
+        lon2 = radians(float(longitude))
+
+        delta_lon = lon2 - lon1
+        delta_lat = lat2 - lat1
+        a = sin(delta_lat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(delta_lon / 2) ** 2
         c = 2 * atan2(sqrt(a), sqrt(1 - a))
 
-        distance = R  * c
+        distance = earth_radius_km * c
+        if not self.settings.metric_units:
+            distance *= 0.621371
 
-        if METRICUNITS == "0":
-            distance = distance * 0.621371
-                
         return round(distance, 2)
 
-def aprs_connect():
-    """Connect to APRS-IS with fallback to common ports"""
-    global aprs
-    
-    # List of ports to try: configured port first, then common ports
-    ports_to_try = [APRS_PORT] + [port for port in COMMON_APRS_PORTS if port != APRS_PORT]
-    
-    for port in ports_to_try:
-        try:
-            logging.info("Attempting to connect to APRS-IS server %s:%d", APRS_HOST, port)
-            
-            # Create a new APRS connection for this attempt
-            aprs = aprslib.IS(APRS_CALLSIGN,
-                            passwd=APRS_PASSWORD,
-                            host=APRS_HOST,
-                            port=port,
-                            skip_login=False)
-            
-            # Listen for specific packet
-            aprs.set_filter(APRS_FILTER)
-            
-            # Try to connect
-            aprs.connect(blocking=True)
-            
-            # If we get here, connection succeeded
-            logging.info("Successfully connected to APRS-IS server %s:%d", APRS_HOST, port)
-            
-            # Start consuming packets
-            logging.debug("APRS Processing: %s", APRS_PROCESS)
-            if APRS_PROCESS == "True":
-                aprs.consumer(callback, raw=True)
-            else:
-                aprs.consumer(callback)
-                
-            # If we successfully start consuming, break out of the loop
-            break
-            
-        except aprslib.exceptions.ConnectionDrop:
-            logging.warning("Connection to APRS server %s:%d dropped", APRS_HOST, port)
-        except aprslib.exceptions.ConnectionError as e:
-            logging.warning("Failed to connect to APRS server %s:%d - %s", APRS_HOST, port, str(e))
-        except Exception as e:
-            logging.error("Unexpected error connecting to APRS server %s:%d - %s", APRS_HOST, port, str(e))
-    
-    # If we've tried all ports and none worked
-    else:
-        logging.error("Failed to connect to APRS-IS server on any of the attempted ports: %s", ports_to_try)
-        logging.info("Retrying in 30 seconds...")
-        time.sleep(30)
-        aprs_connect()  # Retry the whole process
-                    
-# Use the signal module to handle signals
-signal.signal(signal.SIGTERM, cleanup)
-signal.signal(signal.SIGINT, cleanup)
-try:
-    # Connect to the broker and enter the main loop
-    connect()
-    aprs_connect()
+    def close_aprs_client(self) -> None:
+        if self.aprs_client is None:
+            return
 
-except KeyboardInterrupt:
-    logging.info("Interrupted by keypress")
-    sys.exit(0)
+        try:
+            self.aprs_client.close()
+        except Exception:
+            logging.debug("Failed to close APRS client cleanly", exc_info=True)
+        finally:
+            self.aprs_client = None
+
+    def request_stop(self, reason: str | None = None) -> None:
+        if reason:
+            logging.info("Stopping mqtt-aprs: %s", reason)
+
+        already_stopping = self.stop_event.is_set()
+        self.stop_event.set()
+        self.close_aprs_client()
+
+        if not already_stopping:
+            self.publish_presence(False)
+
+        try:
+            self.mqtt_client.disconnect()
+        except Exception:
+            logging.debug("Failed to disconnect MQTT client cleanly", exc_info=True)
+
+        if self.mqtt_loop_started:
+            self.mqtt_client.loop_stop()
+            self.mqtt_loop_started = False
+
+    def run(self) -> None:
+        self.connect_mqtt()
+        self.consume_aprs_forever()
+
+
+def install_signal_handlers(bridge: MqttAprsBridge) -> None:
+    def handle_signal(signum: int, frame: Any) -> None:
+        bridge.request_stop(f"signal {signum}")
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Bridge APRS-IS packets to MQTT topics")
+    parser.add_argument(
+        "-c",
+        "--config",
+        help="Path to mqtt-aprs.cfg. Defaults to /etc/mqtt-aprs/mqtt-aprs.cfg or a local mqtt-aprs.cfg.",
+    )
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="Validate configuration and exit without starting the bridge.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_argument_parser().parse_args(argv)
+
+    try:
+        config_path = resolve_config_path(args.config)
+        settings = load_settings(config_path)
+    except (ConfigError, FileNotFoundError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    if args.check_config:
+        print(f"Configuration OK: {config_path}")
+        return 0
+
+    configure_logging(settings)
+
+    if setproctitle is not None:
+        setproctitle.setproctitle(settings.app_name)
+
+    logging.info("Starting %s", settings.app_name)
+    logging.debug("Using config file %s", config_path)
+
+    try:
+        bridge = MqttAprsBridge(settings)
+    except RuntimeError as exc:
+        logging.error("Startup failed: %s", exc)
+        return 1
+
+    install_signal_handlers(bridge)
+
+    try:
+        bridge.run()
+    except KeyboardInterrupt:
+        logging.info("Interrupted by keypress")
+    except RuntimeError as exc:
+        logging.error("Fatal runtime error: %s", exc)
+        return 1
+    except Exception:
+        logging.exception("Fatal unexpected error")
+        return 1
+    finally:
+        bridge.request_stop("process exit")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
