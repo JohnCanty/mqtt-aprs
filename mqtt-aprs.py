@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-__author__ = "John Canty"
+__Original_Author__ = "Mike Loebl"
+__Refactor_Author__ = "John Canty"
 __copyright__ = "None"
 
 import argparse
