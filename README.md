@@ -199,7 +199,7 @@ Runtime notes:
 - You can override the config path with `--config /path/to/mqtt-aprs.cfg`.
 - You can also override it with the `MQTT_APRS_CONFIG` environment variable.
 - The bundled systemd unit runs `--check-config` before starting the long-running service process.
-- When `MQTT_HOST` or `APRS_HOST` is a hostname, the bundled systemd unit also waits for `nss-lookup.target` in addition to `network-online.target`.
+- The bundled systemd unit starts after `network.target`. The bridge itself retries MQTT and APRS connection failures, so it does not rely on `network-online.target`.
 
 ## Operational Checks
 
@@ -226,7 +226,7 @@ If `LOGFILE` is set, the same runtime messages are also written to that file.
 ## Troubleshooting
 
 - If the service starts with the wrong `ExecStart`, copy the bundled service file again and run `sudo systemctl daemon-reload`.
-- If the service only misbehaves during boot, inspect `sudo journalctl -b -u mqtt-aprs -o short-monotonic --no-pager` first. The bundled unit now validates the config before launch and waits for both network-online and name-service readiness.
+- If the service only misbehaves during boot, inspect `sudo journalctl -b -u mqtt-aprs -o short-monotonic --no-pager` first. The bundled unit validates config before launch, and the process itself keeps retrying until MQTT and APRS become reachable.
 - If `--check-config` fails, fix the missing or invalid settings before starting the service.
 - If the transmit topic rejects packets, confirm the frame is single-line and starts with the configured callsign base.
 - If APRS transmission is enabled but packets are rejected by APRS-IS, verify that `APRS_PASSWORD` is a valid passcode for `APRS_CALLSIGN`.
