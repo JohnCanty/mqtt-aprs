@@ -1,6 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""Bridge APRS-IS traffic into MQTT, with optional MQTT-to-APRS transmit.
+
+The bridge keeps one MQTT connection and one APRS-IS connection alive.
+Inbound APRS packets are parsed and published under structured MQTT topics.
+When transmission is explicitly enabled, a dedicated MQTT topic can submit a
+single APRS frame for transmission through the active APRS-IS connection.
+
+Transmit safety rules:
+- APRS transmission is disabled by default.
+- A verified APRS passcode is required before transmission can be enabled.
+- The transmit topic accepts either a raw APRS frame string or JSON with a
+    ``packet`` field.
+- Outbound packets must be single-line frames whose source callsign matches the
+    configured callsign base.
+"""
+
 from __future__ import annotations
 
 __Original_Author__ = "Mike Loebl"
@@ -19,10 +35,13 @@ import time
 from dataclasses import dataclass
 from math import atan2, cos, radians, sin, sqrt
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import Any
 
+
 def load_optional_module(module_name: str) -> tuple[Any, ImportError | None]:
+    """Import an optional dependency and capture the import error if missing."""
+
     try:
         return importlib.import_module(module_name), None
     except ImportError as exc:
@@ -44,11 +63,15 @@ LOGFORMAT = "%(asctime)-15s %(levelname)s %(message)s"
 
 
 class ConfigError(ValueError):
+    """Raised when the configuration file is present but semantically invalid."""
+
     pass
 
 
 @dataclass(frozen=True)
 class Settings:
+    """Normalized runtime configuration loaded from the INI file."""
+
     debug: bool
     logfile: str
     mqtt_host: str
@@ -56,6 +79,8 @@ class Settings:
     mqtt_subtopic: str
     mqtt_username: str
     mqtt_password: str
+    mqtt_tx_enable: bool
+    mqtt_tx_topic: str
     metric_units: bool
     aprs_callsign: str
     aprs_password: str
@@ -79,6 +104,10 @@ class Settings:
         return f"{self.mqtt_topic}/state"
 
     @property
+    def mqtt_tx_status_topic(self) -> str:
+        return f"{self.mqtt_tx_topic}/status"
+
+    @property
     def aprs_ports_to_try(self) -> tuple[int, ...]:
         ports = [self.aprs_port]
         ports.extend(port for port in COMMON_APRS_PORTS if port != self.aprs_port)
@@ -86,10 +115,20 @@ class Settings:
 
 
 def normalize_text(value: Any) -> str:
+    """Convert a value to trimmed text, treating ``None`` as empty."""
+
     return str(value).strip() if value is not None else ""
 
 
+def callsign_base(callsign: str) -> str:
+    """Return a callsign without SSID, normalized to upper case."""
+
+    return normalize_text(callsign).split("-", 1)[0].upper()
+
+
 def parse_legacy_bool(value: Any, *, default: bool) -> bool:
+    """Parse booleans from legacy config values such as 0/1, True/False, yes/no."""
+
     normalized = normalize_text(value).lower()
     if not normalized:
         return default
@@ -103,6 +142,8 @@ def parse_legacy_bool(value: Any, *, default: bool) -> bool:
 
 
 def parse_optional_int(value: Any, *, option_name: str, default: int | None = None) -> int | None:
+    """Parse an optional integer from config text."""
+
     normalized = normalize_text(value)
     if not normalized:
         return default
@@ -114,6 +155,8 @@ def parse_optional_int(value: Any, *, option_name: str, default: int | None = No
 
 
 def parse_optional_float(value: Any, *, option_name: str) -> float | None:
+    """Parse an optional floating-point value from config text."""
+
     normalized = normalize_text(value)
     if not normalized:
         return None
@@ -125,12 +168,16 @@ def parse_optional_float(value: Any, *, option_name: str) -> float | None:
 
 
 def get_config_value(config: configparser.RawConfigParser, option_name: str, *, default: str = "") -> str:
+    """Read a string value from the ``global`` config section."""
+
     if not config.has_option("global", option_name):
         return default
     return config.get("global", option_name)
 
 
 def get_required_config_value(config: configparser.RawConfigParser, option_name: str) -> str:
+    """Read a required config value and raise a helpful error when it is missing."""
+
     value = normalize_text(get_config_value(config, option_name))
     if not value:
         raise ConfigError(f"Missing required [global] option {option_name}")
@@ -138,6 +185,8 @@ def get_required_config_value(config: configparser.RawConfigParser, option_name:
 
 
 def resolve_config_path(explicit_path: str | None) -> Path:
+    """Resolve the config path from CLI, environment, or default locations."""
+
     if explicit_path:
         config_path = Path(explicit_path).expanduser()
         if config_path.is_file():
@@ -161,6 +210,8 @@ def resolve_config_path(explicit_path: str | None) -> Path:
 
 
 def load_settings(config_path: Path) -> Settings:
+    """Load, normalize, and validate runtime settings from an INI file."""
+
     config = configparser.RawConfigParser()
     if not config.read(config_path):
         raise FileNotFoundError(f"Unable to read config file: {config_path}")
@@ -171,6 +222,18 @@ def load_settings(config_path: Path) -> Settings:
     mqtt_subtopic = get_required_config_value(config, "MQTT_SUBTOPIC").strip("/")
     if not mqtt_subtopic:
         raise ConfigError("MQTT_SUBTOPIC must not be empty")
+
+    mqtt_root_topic = f"RF/{mqtt_subtopic}"
+    mqtt_tx_enable = parse_legacy_bool(get_config_value(config, "MQTT_TX_ENABLE"), default=False)
+    mqtt_tx_topic = normalize_text(get_config_value(config, "MQTT_TX_TOPIC")).strip("/")
+    if not mqtt_tx_topic:
+        mqtt_tx_topic = f"{mqtt_root_topic}/tx"
+
+    if "+" in mqtt_tx_topic or "#" in mqtt_tx_topic:
+        raise ConfigError("MQTT_TX_TOPIC must be a concrete topic and cannot contain MQTT wildcards")
+
+    if mqtt_tx_topic in {mqtt_root_topic, f"{mqtt_root_topic}/state"}:
+        raise ConfigError("MQTT_TX_TOPIC must not overlap the base publish topic or presence topic")
 
     aprs_latitude = parse_optional_float(
         get_config_value(config, "APRS_LATITUDE"),
@@ -198,6 +261,10 @@ def load_settings(config_path: Path) -> Settings:
     if mqtt_port is None or aprs_port is None:
         raise ConfigError("MQTT_PORT and APRS_PORT must resolve to valid integers")
 
+    aprs_password = normalize_text(get_config_value(config, "APRS_PASSWORD", default="-1")) or "-1"
+    if mqtt_tx_enable and aprs_password == "-1":
+        raise ConfigError("MQTT_TX_ENABLE requires a verified APRS passcode instead of -1")
+
     return Settings(
         debug=parse_legacy_bool(get_config_value(config, "DEBUG"), default=False),
         logfile=normalize_text(get_config_value(config, "LOGFILE")),
@@ -206,9 +273,11 @@ def load_settings(config_path: Path) -> Settings:
         mqtt_subtopic=mqtt_subtopic,
         mqtt_username=normalize_text(get_config_value(config, "MQTT_USERNAME")),
         mqtt_password=normalize_text(get_config_value(config, "MQTT_PASSWORD")),
+        mqtt_tx_enable=mqtt_tx_enable,
+        mqtt_tx_topic=mqtt_tx_topic,
         metric_units=parse_legacy_bool(get_config_value(config, "METRICUNITS"), default=False),
         aprs_callsign=get_required_config_value(config, "APRS_CALLSIGN"),
-        aprs_password=normalize_text(get_config_value(config, "APRS_PASSWORD", default="-1")) or "-1",
+        aprs_password=aprs_password,
         aprs_host=get_required_config_value(config, "APRS_HOST"),
         aprs_port=aprs_port,
         aprs_filter=normalize_text(get_config_value(config, "APRS_FILTER")),
@@ -219,6 +288,8 @@ def load_settings(config_path: Path) -> Settings:
 
 
 def configure_logging(settings: Settings) -> None:
+    """Configure process logging, falling back to stderr when file logging fails."""
+
     basic_config_kwargs: dict[str, Any] = {
         "format": LOGFORMAT,
         "level": logging.DEBUG if settings.debug else logging.INFO,
@@ -240,6 +311,8 @@ def configure_logging(settings: Settings) -> None:
 
 
 def ensure_runtime_dependencies() -> None:
+    """Fail fast with a clear error when runtime dependencies are not installed."""
+
     missing_packages = []
 
     if paho is None:
@@ -254,12 +327,22 @@ def ensure_runtime_dependencies() -> None:
 
 
 def decode_packet(packet: bytes | str) -> str:
+    """Decode APRS raw packet bytes using a permissive single-byte codec."""
+
     if isinstance(packet, bytes):
         return packet.decode("latin-1", errors="replace").strip()
     return str(packet).strip()
 
 
+def decode_mqtt_payload(payload: bytes) -> str:
+    """Decode inbound MQTT payload text as UTF-8 with replacement."""
+
+    return payload.decode("utf-8", errors="replace").strip()
+
+
 def mqtt_payload(value: Any) -> str:
+    """Serialize Python values to MQTT payload text."""
+
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace").strip()
     if isinstance(value, dict):
@@ -272,11 +355,17 @@ def mqtt_payload(value: Any) -> str:
 
 
 def reason_code_value(reason_code: Any) -> Any:
+    """Normalize Paho reason code objects into simple comparable values."""
+
     return getattr(reason_code, "value", reason_code)
 
 
 class MqttAprsBridge:
+    """Coordinate MQTT connectivity, APRS-IS consumption, and optional transmit."""
+
     def __init__(self, settings: Settings):
+        """Create the bridge and initialize MQTT state."""
+
         ensure_runtime_dependencies()
         self.settings = settings
         self.stop_event = Event()
@@ -285,9 +374,12 @@ class MqttAprsBridge:
         self.mqtt_connect_result: Any = None
         self.mqtt_loop_started = False
         self.aprs_client: Any | None = None
+        self.aprs_client_lock = Lock()
         self.mqtt_client = self.build_mqtt_client()
 
     def build_mqtt_client(self) -> Any:
+        """Build and configure the Paho MQTT client instance."""
+
         client_id = f"{self.settings.app_name}_{os.getpid()}"
         client = paho.Client(
             paho.CallbackAPIVersion.VERSION2,
@@ -306,6 +398,8 @@ class MqttAprsBridge:
         client.on_connect = self.on_mqtt_connect
         client.on_disconnect = self.on_mqtt_disconnect
         client.on_publish = self.on_mqtt_publish
+        client.on_subscribe = self.on_mqtt_subscribe
+        client.on_message = self.on_mqtt_message
 
         if self.settings.debug:
             client.enable_logger(logging.getLogger("paho.mqtt"))
@@ -313,6 +407,8 @@ class MqttAprsBridge:
         return client
 
     def on_mqtt_connect(self, client: Any, userdata: Any, flags: Any, reason_code: Any, properties: Any) -> None:
+        """Handle MQTT broker connections and restore subscriptions after reconnect."""
+
         code = reason_code_value(reason_code)
         self.mqtt_connect_result = code
         self.mqtt_connection_state.set()
@@ -321,6 +417,17 @@ class MqttAprsBridge:
             self.mqtt_connected.set()
             logging.info("Connected to MQTT %s:%s", self.settings.mqtt_host, self.settings.mqtt_port)
             self.publish_presence(True)
+
+            if self.settings.mqtt_tx_enable:
+                result, _mid = client.subscribe(self.settings.mqtt_tx_topic, qos=1)
+                if result == paho.MQTT_ERR_SUCCESS:
+                    logging.info("Subscribed to outbound APRS MQTT topic %s", self.settings.mqtt_tx_topic)
+                else:
+                    logging.error(
+                        "Failed to subscribe to outbound APRS MQTT topic %s: rc=%s",
+                        self.settings.mqtt_tx_topic,
+                        result,
+                    )
             return
 
         self.mqtt_connected.clear()
@@ -334,6 +441,8 @@ class MqttAprsBridge:
         reason_code: Any,
         properties: Any,
     ) -> None:
+        """Track MQTT disconnects so outbound publishes can react accordingly."""
+
         code = reason_code_value(reason_code)
         self.mqtt_connected.clear()
 
@@ -346,9 +455,47 @@ class MqttAprsBridge:
             )
 
     def on_mqtt_publish(self, client: Any, userdata: Any, mid: int, reason_codes: Any, properties: Any) -> None:
+        """Log publish acknowledgements at debug level."""
+
         logging.debug("MQTT message id %s published", mid)
 
+    def on_mqtt_subscribe(
+        self,
+        client: Any,
+        userdata: Any,
+        mid: int,
+        reason_codes: Any,
+        properties: Any,
+    ) -> None:
+        """Log MQTT subscription acknowledgements for operational visibility."""
+
+        logging.debug("MQTT subscription acknowledged for mid %s", mid)
+
+    def on_mqtt_message(self, client: Any, userdata: Any, msg: Any) -> None:
+        """Accept outbound APRS commands from the configured MQTT topic."""
+
+        if msg.topic != self.settings.mqtt_tx_topic:
+            logging.debug("Ignoring unexpected MQTT message on topic %s", msg.topic)
+            return
+
+        payload_text = decode_mqtt_payload(msg.payload)
+
+        try:
+            packet_text = self.extract_tx_packet(payload_text)
+            self.send_aprs_packet(packet_text)
+        except ValueError as exc:
+            logging.warning("Rejected outbound APRS payload from %s: %s", msg.topic, exc)
+            self.publish_tx_status(False, payload_text, str(exc))
+        except RuntimeError as exc:
+            logging.warning("Failed to send outbound APRS packet from %s: %s", msg.topic, exc)
+            self.publish_tx_status(False, payload_text, str(exc))
+        else:
+            logging.info("Sent outbound APRS packet from MQTT topic %s", msg.topic)
+            self.publish_tx_status(True, packet_text)
+
     def connect_mqtt(self) -> None:
+        """Connect to the MQTT broker and wait for a successful CONNACK."""
+
         while not self.stop_event.is_set():
             try:
                 logging.info("Connecting to MQTT %s:%s", self.settings.mqtt_host, self.settings.mqtt_port)
@@ -399,6 +546,8 @@ class MqttAprsBridge:
         raise RuntimeError("Stopping before MQTT connection was established")
 
     def build_aprs_client(self, port: int) -> Any:
+        """Create an APRS-IS client for a single connection attempt."""
+
         client = aprslib.IS(
             self.settings.aprs_callsign,
             passwd=self.settings.aprs_password,
@@ -413,6 +562,8 @@ class MqttAprsBridge:
         return client
 
     def consume_aprs_forever(self) -> None:
+        """Keep the APRS-IS consumer running with port failover and retry delays."""
+
         while not self.stop_event.is_set():
             for port in self.settings.aprs_ports_to_try:
                 if self.stop_event.is_set():
@@ -421,7 +572,8 @@ class MqttAprsBridge:
                 try:
                     logging.info("Connecting to APRS-IS %s:%s", self.settings.aprs_host, port)
                     client = self.build_aprs_client(port)
-                    self.aprs_client = client
+                    with self.aprs_client_lock:
+                        self.aprs_client = client
                     client.connect(blocking=True)
                     logging.info("Connected to APRS-IS %s:%s", self.settings.aprs_host, port)
                     client.consumer(self.handle_aprs_packet, blocking=True, raw=True)
@@ -457,6 +609,8 @@ class MqttAprsBridge:
                 return
 
     def handle_aprs_packet(self, packet: bytes | str) -> None:
+        """Handle one inbound APRS packet from the APRS-IS stream."""
+
         if self.stop_event.is_set():
             raise StopIteration
 
@@ -473,7 +627,80 @@ class MqttAprsBridge:
 
         self.publish_parsed_packet(parsed_packet)
 
+    def extract_tx_packet(self, payload_text: str) -> str:
+        """Extract and validate an outbound APRS frame from a MQTT payload."""
+
+        if not payload_text:
+            raise ValueError("MQTT TX payload is empty")
+
+        if payload_text.startswith("{") or payload_text.startswith('"'):
+            try:
+                decoded_payload = json.loads(payload_text)
+            except json.JSONDecodeError as exc:
+                raise ValueError("MQTT TX payload contains invalid JSON") from exc
+
+            if isinstance(decoded_payload, str):
+                return self.validate_outbound_packet(decoded_payload)
+
+            if isinstance(decoded_payload, dict):
+                packet_text = normalize_text(decoded_payload.get("packet"))
+                if not packet_text:
+                    raise ValueError("JSON MQTT TX payload must include a non-empty 'packet' field")
+                return self.validate_outbound_packet(packet_text)
+
+            raise ValueError("JSON MQTT TX payload must be a string or an object with a 'packet' field")
+
+        return self.validate_outbound_packet(payload_text)
+
+    def validate_outbound_packet(self, packet_text: str) -> str:
+        """Apply guardrails before allowing a MQTT message onto APRS-IS."""
+
+        packet_text = packet_text.strip()
+        if not packet_text:
+            raise ValueError("Outbound APRS packet is empty")
+        if "\r" in packet_text or "\n" in packet_text:
+            raise ValueError("Outbound APRS packet must be a single line")
+        if packet_text.startswith("#"):
+            raise ValueError("APRS server commands are not allowed on the MQTT TX topic")
+        if ">" not in packet_text or ":" not in packet_text:
+            raise ValueError("Outbound APRS packet must look like FROM>TO:BODY")
+
+        source_callsign = packet_text.split(">", 1)[0]
+        if callsign_base(source_callsign) != callsign_base(self.settings.aprs_callsign):
+            raise ValueError("Outbound APRS packet source must match the configured APRS callsign base")
+
+        return packet_text
+
+    def send_aprs_packet(self, packet_text: str) -> None:
+        """Send a single outbound APRS frame through the active APRS-IS client."""
+
+        client_to_close = None
+        send_error: Exception | None = None
+
+        with self.aprs_client_lock:
+            client = self.aprs_client
+            if client is None:
+                raise RuntimeError("APRS-IS is not currently connected")
+
+            try:
+                client.sendall(packet_text)
+                return
+            except Exception as exc:
+                self.aprs_client = None
+                client_to_close = client
+                send_error = exc
+
+        if client_to_close is not None:
+            try:
+                client_to_close.close()
+            except Exception:
+                logging.debug("Failed to close APRS client after TX failure", exc_info=True)
+
+        raise RuntimeError(f"APRS-IS send failed: {send_error}") from send_error
+
     def publish_parsed_packet(self, packet: dict[str, Any]) -> None:
+        """Publish structured MQTT fields for one parsed APRS packet."""
+
         station_id = normalize_text(packet.get("from"))
         raw_packet = packet.get("raw")
 
@@ -546,32 +773,48 @@ class MqttAprsBridge:
             self.publish_station_value(station_id, "status", status)
 
     def publish_station_value(self, station_id: str, field_name: str, value: Any) -> None:
+        """Publish one field for a specific APRS source callsign."""
+
         topic = f"{self.settings.mqtt_topic}/{station_id}/{field_name}"
         self.publish(topic, value)
 
     def publish_without_station(self, value: Any) -> None:
+        """Publish a raw APRS payload when structured parsing is disabled or fails."""
+
         self.publish(self.settings.mqtt_topic, decode_packet(value))
 
     def publish_presence(self, online: bool) -> None:
+        """Publish retained process liveness state to MQTT."""
+
         try:
-            result = self.mqtt_client.publish(
-                self.settings.presence_topic,
-                "1" if online else "0",
-                retain=True,
-            )
-            if result.rc != paho.MQTT_ERR_SUCCESS:
-                logging.debug("Presence publish returned rc=%s", result.rc)
+            self.publish(self.settings.presence_topic, "1" if online else "0", retain=True)
         except Exception:
             logging.debug("Failed to publish presence state", exc_info=True)
 
-    def publish(self, topic: str, value: Any) -> None:
+    def publish_tx_status(self, ok: bool, packet_text: str, error: str | None = None) -> None:
+        """Publish a structured status message for MQTT-to-APRS transmit attempts."""
+
+        status_payload: dict[str, Any] = {
+            "ok": ok,
+            "packet": packet_text,
+        }
+        if error:
+            status_payload["error"] = error
+
+        self.publish(self.settings.mqtt_tx_status_topic, status_payload)
+
+    def publish(self, topic: str, value: Any, *, retain: bool = False) -> None:
+        """Publish a value to MQTT and log any broker-side error codes."""
+
         payload = mqtt_payload(value)
         logging.debug("Publishing topic %s with value %s", topic, payload)
-        result = self.mqtt_client.publish(topic, payload)
+        result = self.mqtt_client.publish(topic, payload, retain=retain)
         if result.rc != paho.MQTT_ERR_SUCCESS:
             logging.warning("Failed to publish topic %s: rc=%s", topic, result.rc)
 
     def get_distance(self, latitude: float, longitude: float) -> float | None:
+        """Return distance from the configured reference point, if available."""
+
         if self.settings.aprs_latitude is None or self.settings.aprs_longitude is None:
             return None
 
@@ -593,17 +836,23 @@ class MqttAprsBridge:
         return round(distance, 2)
 
     def close_aprs_client(self) -> None:
-        if self.aprs_client is None:
+        """Close and forget the current APRS-IS client, if one exists."""
+
+        with self.aprs_client_lock:
+            client = self.aprs_client
+            self.aprs_client = None
+
+        if client is None:
             return
 
         try:
-            self.aprs_client.close()
+            client.close()
         except Exception:
             logging.debug("Failed to close APRS client cleanly", exc_info=True)
-        finally:
-            self.aprs_client = None
 
     def request_stop(self, reason: str | None = None) -> None:
+        """Initiate a clean shutdown across MQTT and APRS resources."""
+
         if reason:
             logging.info("Stopping mqtt-aprs: %s", reason)
 
@@ -624,11 +873,15 @@ class MqttAprsBridge:
             self.mqtt_loop_started = False
 
     def run(self) -> None:
+        """Start the bridge and block until the APRS consumer exits."""
+
         self.connect_mqtt()
         self.consume_aprs_forever()
 
 
 def install_signal_handlers(bridge: MqttAprsBridge) -> None:
+    """Install SIGINT and SIGTERM handlers that request a graceful shutdown."""
+
     def handle_signal(signum: int, frame: Any) -> None:
         bridge.request_stop(f"signal {signum}")
 
@@ -637,6 +890,8 @@ def install_signal_handlers(bridge: MqttAprsBridge) -> None:
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
+    """Create the command-line interface for validation and runtime startup."""
+
     parser = argparse.ArgumentParser(description="Bridge APRS-IS packets to MQTT topics")
     parser.add_argument(
         "-c",
@@ -652,6 +907,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Program entrypoint used by both CLI execution and tests."""
+
     args = build_argument_parser().parse_args(argv)
 
     try:

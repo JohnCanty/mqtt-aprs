@@ -1,18 +1,40 @@
 [global]
+
+; Logging
 DEBUG = False
 LOGFILE = /var/log/mqtt-aprs.log
+
+; MQTT broker connection
 MQTT_HOST = 10.0.0.1
 MQTT_PORT = 1883
 MQTT_SUBTOPIC = aprs
 MQTT_USERNAME = 
 MQTT_PASSWORD = 
+
+; Optional MQTT-to-APRS transmit path.
+; When enabled, publish a raw APRS frame or JSON like
+; {"packet": "N0CALL>APRS,TCPIP*:>status text"}
+; to MQTT_TX_TOPIC. A verified APRS passcode is required.
+MQTT_TX_ENABLE = False
+MQTT_TX_TOPIC = 
+
+; Local reference position used for distance calculations.
 ; Leave coordinates blank to disable distance publishing.
 APRS_LATITUDE = 
 APRS_LONGITUDE = 
+
+; APRS-IS connection and login.
 APRS_CALLSIGN = N0CALL
+; Use -1 for receive-only mode. A valid passcode is required for transmit.
 APRS_PASSWORD = -1
 APRS_HOST = rotate.aprs.net
 APRS_PORT = 14580
 APRS_FILTER = 
+
+; When True, publish parsed fields under RF/<MQTT_SUBTOPIC>/<CALLSIGN>/...
+; When False, publish only the raw packet to RF/<MQTT_SUBTOPIC>.
 APRS_PROCESS = True
+
+; True keeps output values in metric units.
+; False converts distance, speed, and altitude to imperial units.
 METRICUNITS = False
