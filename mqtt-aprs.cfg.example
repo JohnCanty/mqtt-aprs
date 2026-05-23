@@ -2,6 +2,8 @@
 
 ; Logging
 DEBUG = False
+; Logs are always sent to stderr/journal. When LOGFILE is set they are also
+; written to that file.
 LOGFILE = /var/log/mqtt-aprs.log
 
 ; MQTT broker connection

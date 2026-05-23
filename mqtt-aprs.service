@@ -1,13 +1,17 @@
 [Unit]
 Description=mqtt-aprs service
-After=network-online.target
-Wants=network-online.target
+After=network-online.target nss-lookup.target
+Wants=network-online.target nss-lookup.target
 
 [Service]
 Type=simple
 User=mqtt-aprs
 Group=mqtt-aprs
 WorkingDirectory=/opt/mqtt-aprs
+SyslogIdentifier=mqtt-aprs
+StandardOutput=journal
+StandardError=journal
+ExecStartPre=/opt/mqtt-aprs/venv/bin/python /opt/mqtt-aprs/mqtt-aprs.py --check-config
 ExecStart=/opt/mqtt-aprs/venv/bin/python /opt/mqtt-aprs/mqtt-aprs.py
 Restart=on-failure
 RestartSec=5

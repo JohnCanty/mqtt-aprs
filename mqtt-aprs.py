@@ -288,26 +288,42 @@ def load_settings(config_path: Path) -> Settings:
 
 
 def configure_logging(settings: Settings) -> None:
-    """Configure process logging, falling back to stderr when file logging fails."""
+    """Configure process logging to stderr and optionally to a file."""
 
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     basic_config_kwargs: dict[str, Any] = {
         "format": LOGFORMAT,
         "level": logging.DEBUG if settings.debug else logging.INFO,
+        "handlers": handlers,
         "force": True,
     }
 
     if settings.logfile:
         try:
-            logging.basicConfig(filename=settings.logfile, **basic_config_kwargs)
+            handlers.append(logging.FileHandler(settings.logfile, encoding="utf-8"))
         except OSError as exc:
-            logging.basicConfig(stream=sys.stderr, **basic_config_kwargs)
+            logging.basicConfig(**basic_config_kwargs)
             logging.warning(
-                "Failed to open log file %s: %s. Falling back to stderr.",
+                "Failed to open log file %s: %s. Continuing with stderr logging only.",
                 settings.logfile,
                 exc,
             )
+        else:
+            logging.basicConfig(**basic_config_kwargs)
     else:
-        logging.basicConfig(stream=sys.stderr, **basic_config_kwargs)
+        logging.basicConfig(**basic_config_kwargs)
+
+
+def mqtt_error_message(error_code: Any) -> str:
+    """Return a human-readable Paho MQTT error string when possible."""
+
+    if paho is None:
+        return str(error_code)
+
+    try:
+        return paho.error_string(error_code)
+    except Exception:
+        return str(error_code)
 
 
 def ensure_runtime_dependencies() -> None:
@@ -512,24 +528,28 @@ class MqttAprsBridge:
                         self.mqtt_loop_started = True
 
                 if result != paho.MQTT_ERR_SUCCESS:
-                    raise RuntimeError(f"MQTT connect returned error code {result}")
-
-                if not self.mqtt_connection_state.wait(timeout=MQTT_CONNECT_TIMEOUT_SECONDS):
                     logging.warning(
-                        "Timed out waiting for MQTT connection acknowledgement after %s seconds",
-                        MQTT_CONNECT_TIMEOUT_SECONDS,
-                    )
-                elif self.mqtt_connect_result == 0:
-                    return
-                elif self.mqtt_connect_result in {1, 2, 4, 5}:
-                    raise RuntimeError(
-                        f"MQTT connection failed with non-retryable reason code {self.mqtt_connect_result}"
+                        "MQTT connect call returned error code %s (%s). Retrying.",
+                        result,
+                        mqtt_error_message(result),
                     )
                 else:
-                    logging.warning(
-                        "MQTT connection failed with reason code %s. Retrying.",
-                        self.mqtt_connect_result,
-                    )
+                    if not self.mqtt_connection_state.wait(timeout=MQTT_CONNECT_TIMEOUT_SECONDS):
+                        logging.warning(
+                            "Timed out waiting for MQTT connection acknowledgement after %s seconds",
+                            MQTT_CONNECT_TIMEOUT_SECONDS,
+                        )
+                    elif self.mqtt_connect_result == 0:
+                        return
+                    elif self.mqtt_connect_result in {1, 2, 4, 5}:
+                        raise RuntimeError(
+                            f"MQTT connection failed with non-retryable reason code {self.mqtt_connect_result}"
+                        )
+                    else:
+                        logging.warning(
+                            "MQTT connection failed with reason code %s. Retrying.",
+                            self.mqtt_connect_result,
+                        )
 
                 try:
                     self.mqtt_client.disconnect()

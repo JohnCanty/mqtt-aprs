@@ -123,7 +123,7 @@ All settings live in the `[global]` section.
 | Option | Required | Description |
 | --- | --- | --- |
 | `DEBUG` | No | Enables debug logging when `True`. |
-| `LOGFILE` | No | Path to the runtime log file. Leave blank to log to stderr. |
+| `LOGFILE` | No | Path to an additional runtime log file. Logs always go to stderr/journal; when this is set they are also written to the file. |
 | `MQTT_HOST` | Yes | MQTT broker hostname or IP address. |
 | `MQTT_PORT` | No | MQTT broker TCP port. Defaults to `1883`. |
 | `MQTT_SUBTOPIC` | Yes | Topic suffix published under `RF/<MQTT_SUBTOPIC>`. |
@@ -198,6 +198,8 @@ Runtime notes:
 - The default config path is `/etc/mqtt-aprs/mqtt-aprs.cfg`.
 - You can override the config path with `--config /path/to/mqtt-aprs.cfg`.
 - You can also override it with the `MQTT_APRS_CONFIG` environment variable.
+- The bundled systemd unit runs `--check-config` before starting the long-running service process.
+- When `MQTT_HOST` or `APRS_HOST` is a hostname, the bundled systemd unit also waits for `nss-lookup.target` in addition to `network-online.target`.
 
 ## Operational Checks
 
@@ -213,9 +215,18 @@ Show recent service logs:
 sudo journalctl -u mqtt-aprs -n 100 --no-pager
 ```
 
+Show logs from the current boot with monotonic timestamps:
+
+```bash
+sudo journalctl -b -u mqtt-aprs -o short-monotonic --no-pager
+```
+
+If `LOGFILE` is set, the same runtime messages are also written to that file.
+
 ## Troubleshooting
 
 - If the service starts with the wrong `ExecStart`, copy the bundled service file again and run `sudo systemctl daemon-reload`.
+- If the service only misbehaves during boot, inspect `sudo journalctl -b -u mqtt-aprs -o short-monotonic --no-pager` first. The bundled unit now validates the config before launch and waits for both network-online and name-service readiness.
 - If `--check-config` fails, fix the missing or invalid settings before starting the service.
 - If the transmit topic rejects packets, confirm the frame is single-line and starts with the configured callsign base.
 - If APRS transmission is enabled but packets are rejected by APRS-IS, verify that `APRS_PASSWORD` is a valid passcode for `APRS_CALLSIGN`.
