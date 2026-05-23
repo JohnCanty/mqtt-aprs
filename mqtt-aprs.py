@@ -534,6 +534,8 @@ class MqttAprsBridge:
                         mqtt_error_message(result),
                     )
                 else:
+                    # Paho only reports a usable session after the on_connect
+                    # callback updates the shared connection state.
                     if not self.mqtt_connection_state.wait(timeout=MQTT_CONNECT_TIMEOUT_SECONDS):
                         logging.warning(
                             "Timed out waiting for MQTT connection acknowledgement after %s seconds",
@@ -551,6 +553,7 @@ class MqttAprsBridge:
                             self.mqtt_connect_result,
                         )
 
+                # Clear any partial client state before the next retry attempt.
                 try:
                     self.mqtt_client.disconnect()
                 except Exception:
@@ -596,6 +599,8 @@ class MqttAprsBridge:
                         self.aprs_client = client
                     client.connect(blocking=True)
                     logging.info("Connected to APRS-IS %s:%s", self.settings.aprs_host, port)
+                    # consumer() blocks until the APRS stream exits or raises,
+                    # so this call is the long-running APRS read loop.
                     client.consumer(self.handle_aprs_packet, blocking=True, raw=True)
                     logging.warning("APRS consumer exited cleanly. Reconnecting.")
                 except (aprslib.ConnectionDrop, aprslib.ConnectionError) as exc:
@@ -706,6 +711,8 @@ class MqttAprsBridge:
                 client.sendall(packet_text)
                 return
             except Exception as exc:
+                # Force the retry loop to establish a fresh APRS session after
+                # a failed send on the cached client.
                 self.aprs_client = None
                 client_to_close = client
                 send_error = exc
@@ -746,6 +753,8 @@ class MqttAprsBridge:
         if symbol_table and symbol:
             self.publish_station_value(station_id, "icon", f"{symbol_table}{symbol}")
 
+        # Normalize numeric fields before publishing so MQTT payloads stay
+        # stable even when aprslib returns ints, floats, or strings.
         latitude = packet.get("latitude")
         longitude = packet.get("longitude")
         if latitude is not None and longitude is not None:

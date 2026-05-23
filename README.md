@@ -14,6 +14,14 @@ This project uses [aprslib](https://github.com/rossengeorgiev/aprs-python) for A
 
 It is a descendant of the original mqtt-owfs-temp work by Kyle Gordon and the mqtt-aprs fork by eloebl.
 
+## Documentation Map
+
+- This README is the operator guide for installation, configuration, startup, and troubleshooting.
+- [docs/PROGRAM_REFERENCE.md](docs/PROGRAM_REFERENCE.md) is the full runtime and code-structure reference.
+- [mqtt-aprs.cfg.example](mqtt-aprs.cfg.example) is the annotated sample configuration.
+- [mqtt-aprs.service](mqtt-aprs.service) is the bundled systemd unit for unattended service deployment.
+- [mqtt-aprs.default](mqtt-aprs.default) is a legacy defaults file retained in the repository for compatibility history; the bundled systemd unit does not currently consume it.
+
 ## Features
 
 - Receive APRS-IS packets and publish them to MQTT.
@@ -31,6 +39,8 @@ It is a descendant of the original mqtt-owfs-temp work by Kyle Gordon and the mq
 4. If `APRS_PROCESS = True`, parsed fields are published under per-station MQTT topics.
 5. If `APRS_PROCESS = False`, only the raw packet is published to the base MQTT topic.
 6. If `MQTT_TX_ENABLE = True`, the service subscribes to a dedicated MQTT topic and forwards approved APRS frames to APRS-IS.
+
+For the full startup sequence, retry model, topic serialization rules, and class/function map, see [docs/PROGRAM_REFERENCE.md](docs/PROGRAM_REFERENCE.md).
 
 ## MQTT Topic Layout
 
@@ -112,6 +122,24 @@ Example publishes:
 ```bash
 mosquitto_pub -h 10.0.0.1 -t RF/aprs/tx -m 'N0CALL>APRS,TCPIP*:>status text'
 mosquitto_pub -h 10.0.0.1 -t RF/aprs/tx -m '{"packet":"N0CALL>APRS,TCPIP*:>status text"}'
+```
+
+Worked transmit example:
+
+```text
+N0CALL-10>APRS,TCPIP*:>mqtt-aprs test packet
+```
+
+Packet breakdown:
+
+- `N0CALL-10` is the source callsign/SSID. Its base callsign must match `APRS_CALLSIGN`.
+- `APRS,TCPIP*` is the destination and APRS-IS path.
+- `:>mqtt-aprs test packet` is the APRS information field, in this case a status payload.
+
+Equivalent test publish:
+
+```bash
+mosquitto_pub -h 10.0.0.1 -t RF/aprs/tx -m 'N0CALL-10>APRS,TCPIP*:>mqtt-aprs test packet'
 ```
 
 ## Configuration Reference
@@ -209,6 +237,12 @@ Show service status:
 sudo systemctl status mqtt-aprs
 ```
 
+Run the service manually in the foreground:
+
+```bash
+/opt/mqtt-aprs/venv/bin/python /opt/mqtt-aprs/mqtt-aprs.py --config /etc/mqtt-aprs/mqtt-aprs.cfg
+```
+
 Show recent service logs:
 
 ```bash
@@ -223,6 +257,12 @@ sudo journalctl -b -u mqtt-aprs -o short-monotonic --no-pager
 
 If `LOGFILE` is set, the same runtime messages are also written to that file.
 
+Watch MQTT output live during testing:
+
+```bash
+mosquitto_sub -h 10.0.0.1 -v -t 'RF/aprs/#'
+```
+
 ## Troubleshooting
 
 - If the service starts with the wrong `ExecStart`, copy the bundled service file again and run `sudo systemctl daemon-reload`.
@@ -230,6 +270,8 @@ If `LOGFILE` is set, the same runtime messages are also written to that file.
 - If `--check-config` fails, fix the missing or invalid settings before starting the service.
 - If the transmit topic rejects packets, confirm the frame is single-line and starts with the configured callsign base.
 - If APRS transmission is enabled but packets are rejected by APRS-IS, verify that `APRS_PASSWORD` is a valid passcode for `APRS_CALLSIGN`.
+
+For detailed internals, field-by-field MQTT payload rules, and lifecycle behavior, see [docs/PROGRAM_REFERENCE.md](docs/PROGRAM_REFERENCE.md).
 
 ## Improvement Areas
 
