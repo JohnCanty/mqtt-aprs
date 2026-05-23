@@ -34,16 +34,16 @@ flowchart TD
     A[Process start] --> B[Parse CLI args]
     B --> C[Resolve config path]
     C --> D[Load and validate settings]
-    D --> E{--check-config?}
-    E -- yes --> F[Print Configuration OK and exit 0]
+  D --> E{Config check only}
+  E -- yes --> F[Print configuration OK and exit]
     E -- no --> G[Configure logging]
     G --> H[Optionally set process title]
-    H --> I[Construct MqttAprsBridge]
+  H --> I[Construct bridge]
     I --> J[Connect to MQTT]
     J --> K[Consume APRS forever]
-    K --> L[Publish MQTT topics]
-    M[SIGTERM or SIGINT] --> N[request_stop()]
-    N --> O[Publish presence 0, close APRS, stop MQTT]
+  K --> L[Handle APRS packets and publish MQTT]
+  S[Signal received] --> M[Request stop]
+  M --> N[Publish presence 0 and close clients]
 ```
 
 ## Configuration Resolution
